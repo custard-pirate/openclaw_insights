@@ -1,1 +1,2 @@
 openclaw doctor --generate-gateway-token ## when there's a sync issue
+curl http://localhost:11434/api/tags ## list models available via OpenAI API on Ollama
