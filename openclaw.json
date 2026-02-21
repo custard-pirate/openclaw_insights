@@ -94,7 +94,7 @@
     "telegram": {
       "enabled": true,
       "dmPolicy": "pairing",
-      "botToken": "8477086733:AAGA-sF29o-tbEqNLoAq8P8Bl3W8HOtl2ow",
+      "botToken": "$TELEGRAM_BOT_TOKEN",
       "groupPolicy": "allowlist",
       "streamMode": "partial"
     }
