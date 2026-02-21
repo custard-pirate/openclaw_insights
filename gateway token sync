@@ -1,0 +1,46 @@
+  What was wrong
+
+  The device token had only the operator.admin scope, but newer versions of the CLI request additional scopes
+  (operator.approvals, operator.pairing, and operator.read) on connection. The gateway rejected these as unauthorized
+  scope upgrades, producing the pairing required (1008) error.
+
+  What was fixed
+
+  1. Updated ~/.openclaw/devices/paired.json to add the missing scopes to unblock the initial CLI connection
+  2. Used openclaw devices rotate (via the now-working connection) to properly issue a new token with all four scopes
+
+  ---
+  Commands to use if this happens again
+
+  Diagnose:
+  openclaw doctor
+  journalctl --user -u openclaw-gateway --no-pager -n 30
+
+  Look for scope-upgrade entries in the journal — they'll tell you exactly which scopes are missing (scopesFrom vs
+  scopesTo).
+
+  Fix (full sequence):
+  # 1. Get your device ID
+  DEVICE_ID=$(python3 -c "import json; d=json.load(open('/home/zoe/.openclaw/identity/device.json'));
+  print(d['deviceId'])")
+
+  # 2. Bootstrap the connection by temporarily adding the needed scopes to paired.json,
+  #    then rotate via the API to make it permanent:
+  openclaw devices rotate \
+    --device "$DEVICE_ID" \
+    --role operator \
+    --scope operator.admin \
+    --scope operator.approvals \
+    --scope operator.pairing \
+    --scope operator.read \
+    --json
+
+  # 3. Verify
+  openclaw health
+
+  If the CLI can't connect at all (chicken-and-egg — rotate itself fails), add scopes to ~/.openclaw/devices/paired.json
+   manually first, then kill and let systemd restart the gateway, then run the rotate command:
+  # Kill gateway so systemd restarts it with the edited paired.json
+  kill $(pgrep -f openclaw-gateway)
+  sleep 5
+  # Then run the rotate command above
