@@ -1,0 +1,272 @@
+{
+  "gateway": {
+    "port": 18789,
+    "host": "127.0.0.1",
+    "logLevel": "info"
+  },
+
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "OPENROUTER_API_KEY_ENV_OR_FILE",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "openrouter/qwen/qwen3.5-plus-02-15",
+            "name": "qwen3.5-plus",
+            "default": true
+          },
+          {
+            "id": "openrouter/qwen/qwen3.5-instruct",
+            "name": "qwen3.5-instruct"
+          },
+          {
+            "id": "openrouter/deepseek/deepseek-v3",
+            "name": "deepseek-v3"
+          }
+        ]
+      },
+      "ollama": {
+        "baseUrl": "http://127.0.0.1:11434/v1",
+        "api": "openai",
+        "models": [
+          {
+            "id": "ollama/qwen2.5:14b",
+            "name": "qwen2.5-14b-local"
+          },
+          {
+            "id": "ollama/qwen2.5-coder:14b",
+            "name": "qwen2.5-coder-14b-local"
+          },
+          {
+            "id": "ollama/smollm2:1.7b",
+            "name": "smollm2-1.7b-local"
+          }
+        ]
+      }
+    }
+  },
+
+  "agents": {
+    "zoe": {
+      "title": "Zoe – Chief of Staff",
+      "description": "Main orchestrator responsible for delegating tasks to agents and sub-agents.",
+      "model": "openrouter/qwen/qwen3.5-plus-02-15",
+      "system": "You are Zoe, the user's Chief of Staff and main orchestrator. Understand the user's goals, break work into subtasks, and decide when to delegate to persistent agents (Bob, Doc, Amy, Erin, Frank, Frank Local Analyst, and local workers) versus spawning temporary sub-agents with specific models. Coordinate, prioritize, and keep track of ongoing tasks. Use web_search (Perplexity Sonar) for internet research when needed.",
+      "tools": {
+        "profile": "full",
+        "allow": [
+          "web_search",
+          "group:sessions",
+          "group:messaging",
+          "group:memory",
+          "agent_to_agent",
+          "subagents"
+        ],
+        "deny": [
+          "exec",
+          "browser"
+        ]
+      }
+    },
+
+    "bob": {
+      "title": "Bob – Network Monitor",
+      "description": "Persistent local agent focused on network monitoring and infra health.",
+      "model": "ollama/qwen2.5:14b",
+      "system": "You are Bob, a persistent local agent focused on network monitoring and infrastructure health. Interpret logs, alerts, and metrics; summarize status; and suggest concrete troubleshooting or remediation steps. You are delegated work by Zoe.",
+      "tools": {
+        "profile": "minimal",
+        "allow": [
+          "group:fs",
+          "group:runtime",
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "exec",
+          "web_search",
+          "browser"
+        ]
+      }
+    },
+
+    "doc": {
+      "title": "Doc – Health & Wellbeing Advisor",
+      "description": "Persistent non-local agent for health and wellbeing topics.",
+      "model": "openrouter/qwen/qwen3.5-instruct",
+      "system": "You are Doc, a persistent non-local agent focused on health, wellbeing, stress management, and lifestyle optimization. Provide general information and suggestions only, not medical diagnosis. Encourage the user to consult qualified professionals for any medical concerns. You are delegated work by Zoe.",
+      "tools": {
+        "profile": "minimal",
+        "allow": [
+          "web_search",
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "group:fs",
+          "group:runtime",
+          "exec",
+          "browser"
+        ]
+      }
+    },
+
+    "amy": {
+      "title": "Amy – Administrative Assistant",
+      "description": "Persistent local agent handling admin, email, calendar, to-do lists, daily bulletins, and heartbeat checks.",
+      "model": "ollama/qwen2.5:14b",
+      "system": "You are Amy, a persistent local administrative assistant. Help with email triage, calendar planning, to-do list management, and generating daily bulletins and heartbeat/status summaries for the user. Coordinate with Zoe and follow her priorities.",
+      "tools": {
+        "profile": "messaging",
+        "allow": [
+          "sessions_list",
+          "sessions_send",
+          "sessions_history",
+          "group:messaging",
+          "group:memory"
+        ],
+        "deny": [
+          "exec",
+          "group:fs",
+          "browser"
+        ]
+      }
+    },
+
+    "erin": {
+      "title": "Erin – Finance Manager",
+      "description": "Persistent non-local agent for investment tracking, analysis, and retirement planning.",
+      "model": "openrouter/deepseek/deepseek-v3",
+      "system": "You are Erin, a persistent non-local finance manager. Help with investment tracking, portfolio analysis, investment strategies, and retirement planning at an informational level only. Do not provide regulated financial advice; instead, explain options, risks, and trade-offs and recommend consulting licensed professionals for decisions.",
+      "tools": {
+        "profile": "minimal",
+        "allow": [
+          "web_search",
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "group:fs",
+          "group:runtime",
+          "exec",
+          "browser"
+        ]
+      }
+    },
+
+    "frank": {
+      "title": "Frank – Researcher & Data Analyst",
+      "description": "Persistent hybrid agent for research and data analysis tasks.",
+      "model": "openrouter/qwen/qwen3.5-plus-02-15",
+      "system": "You are Frank, a persistent researcher and data analyst. Perform research, compare sources, and help with quantitative and qualitative analysis. For heavy local analysis workloads, you may ask Zoe to route work to 'frank_local_analyst', which runs on the local Qwen2.5-14B model.",
+      "tools": {
+        "profile": "coding",
+        "allow": [
+          "web_search",
+          "group:fs",
+          "group:runtime",
+          "sessions_list",
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "exec",
+          "browser"
+        ]
+      }
+    },
+
+    "frank_local_analyst": {
+      "title": "Frank – Local Analyst (Qwen2.5-14B)",
+      "description": "Persistent local analysis agent running on Qwen2.5-14B via Ollama.",
+      "model": "ollama/qwen2.5:14b",
+      "system": "You are Frank's local analysis counterpart, running on the local Qwen2.5-14B model. Focus on heavier analysis tasks that benefit from a larger local model: number crunching, longer-context reasoning over local data, and offline-friendly workloads. You are invoked by Zoe or Frank, and you return concise, structured results.",
+      "tools": {
+        "profile": "coding",
+        "allow": [
+          "group:fs",
+          "group:runtime",
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "web_search",
+          "exec",
+          "browser"
+        ]
+      }
+    },
+
+    "local_smollm2": {
+      "title": "Local SmolLM2 Worker",
+      "description": "Persistent lightweight local worker using SmolLM2 for simple tasks.",
+      "model": "ollama/smollm2:1.7b",
+      "system": "You are a persistent lightweight local worker model. Focus on simple, low-stakes tasks (quick summaries, formatting, trivial reasoning) where speed and low resource usage are more important than peak quality. You may be used as a helper or as the base for spawned sub-agents.",
+      "tools": {
+        "profile": "minimal",
+        "allow": [
+          "sessions_send",
+          "sessions_history"
+        ],
+        "deny": [
+          "web_search",
+          "group:fs",
+          "group:runtime",
+          "exec",
+          "browser"
+        ]
+      }
+    }
+  },
+
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "perplexity",
+        "perplexity": {
+          "apiKey": "PPLX_API_KEY_ENV_OR_FILE",
+          "baseUrl": "https://api.perplexity.ai",
+          "model": "perplexity/sonar-pro"
+        }
+      }
+    },
+
+    "agentToAgent": {
+      "enabled": true,
+      "allow": [
+        "bob",
+        "doc",
+        "amy",
+        "erin",
+        "frank",
+        "frank_local_analyst",
+        "local_smollm2"
+      ]
+    },
+
+    "subagents": {
+      "enabled": true,
+      "allowAgents": ["zoe"],
+      "maxSpawnDepth": 2,
+      "maxChildrenPerAgent": 5,
+      "defaults": {
+        "model": "openrouter/qwen/qwen3.5-plus-02-15"
+      }
+    }
+  },
+
+  "workspace": {
+    "root": "/home/steve/.openclaw/workspace",
+    "autoCreate": true
+  },
+
+  "security": {
+    "allowFs": false,
+    "allowShell": false,
+    "allowNetwork": true
+  }
+}
