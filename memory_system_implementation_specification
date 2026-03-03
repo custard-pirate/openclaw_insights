@@ -1,0 +1,1198 @@
+# Memory System — Implementation Specification
+*Version 1.0 — 2026-03-03*
+*Status: Implemented and live on main OpenClaw instance*
+
+---
+
+## 1. Purpose
+
+This document is a complete implementation specification for the OpenClaw team memory system. It is intended to allow the system to be reproduced from scratch on a new instance. All architectural decisions, file contents, schema definitions, configuration values, and integration steps are captured here.
+
+---
+
+## 2. Background & Design Rationale
+
+### 2.1 Why not the original spec (Qdrant + Kùzu)?
+
+The original `MEMORY_ARCHITECTURE_SPEC.md` (v0.3) proposed Qdrant (vector DB) + Kùzu (graph DB) + a dedicated embedding server. This was rejected for the following reasons:
+
+- The embedding server assumption was wrong — the local llama.cpp instance runs in completion mode and cannot serve embeddings without a full restart with a different model loaded.
+- At the corpus size in question (~240 KB, ~300 chunks), Qdrant and Kùzu provide no practical benefit over in-process alternatives.
+- Both require Docker containers to operate, adding infrastructure to monitor and maintain.
+- Kùzu's advantage (hybrid vector+graph queries in a single call) only materialises at >100K nodes.
+
+### 2.2 What was chosen instead
+
+A fully in-process Python stack with zero new infrastructure:
+
+| Need | Solution |
+|---|---|
+| Semantic search | `fastembed` (ONNX, CPU) + FAISS flat index |
+| Keyword search | SQLite FTS5 (built into Python's `sqlite3`) |
+| Knowledge graph | SQLite node/edge tables |
+| Entity extraction | Local Qwen model via OpenAI-compatible API |
+| Optional reranking | Local Qwen model (same API) |
+| File watching | `watchdog` library |
+
+**Scale ceiling:** This design handles up to ~500K chunks (~500 MB corpus) before degradation. At that point, swap FAISS flat for FAISS IVF and SQLite for Qdrant — the `memory.py` API interface is unchanged; only internals change.
+
+---
+
+## 3. System Requirements
+
+- Python 3.12+
+- SQLite 3.35+ with FTS5 compiled in (verify: `python3 -c "import sqlite3; c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE t USING fts5(x)')"`)
+- A local OpenAI-compatible LLM API (llama.cpp, Ollama, etc.) — used for entity extraction and optional reranking. Model is auto-detected from `/v1/models`.
+- Internet access on first run only (fastembed downloads the embedding model, ~130 MB, on first use and caches it)
+- OpenClaw gateway (for skill registration and cron jobs)
+
+### 3.1 Python packages
+
+Install into a virtualenv (do not use `--break-system-packages`):
+
+```bash
+python3 -m venv /path/to/scripts/memory/.venv
+.venv/bin/pip install fastembed faiss-cpu watchdog
+```
+
+Exact packages installed on reference instance:
+- `fastembed==0.7.4`
+- `faiss-cpu==1.13.2`
+- `watchdog==6.0.0`
+- `onnxruntime==1.24.2` (pulled in by fastembed)
+- `numpy==2.4.2` (pulled in by fastembed/faiss)
+- `requests==2.32.5` (stdlib alternative also works)
+
+---
+
+## 4. File Layout
+
+```
+/home/openclaw/.openclaw/workspace/scripts/memory/
+├── .venv/                        Python virtualenv
+├── config.json                   Configuration (edit this to adapt to new instance)
+├── memory.py                     Core library + search/facts/stats CLI
+├── indexer.py                    Indexing + entity extraction CLI
+├── watcher.py                    File watcher daemon (optional, for live reindex)
+└── data/                         Created automatically on first run
+    └── memory.db                 SQLite database (all state lives here)
+
+/home/openclaw/.openclaw/skills/memory/
+└── SKILL.md                      OpenClaw skill definition (agents use this)
+```
+
+---
+
+## 5. Configuration — `config.json`
+
+```json
+{
+  "qwen_base_url": "http://<local-llm-host>:<port>/v1",
+  "qwen_model": "auto",
+  "memory_dirs": [
+    "/path/to/workspace/memory"
+  ],
+  "memory_files": [
+    "/path/to/workspace/MEMORY.md"
+  ],
+  "db_path": "/path/to/scripts/memory/data/memory.db",
+  "embedding_model": "BAAI/bge-small-en-v1.5",
+  "chunk_size": 300,
+  "top_k_fts": 20,
+  "top_k_vector": 20,
+  "top_k_final": 5,
+  "rerank_with_qwen": false,
+  "extract_entities": true,
+  "ttl_days": 90
+}
+```
+
+**Key fields:**
+
+| Field | Notes |
+|---|---|
+| `qwen_base_url` | Base URL of the OpenAI-compatible API. Do NOT include `/chat/completions`. |
+| `qwen_model` | `"auto"` queries `/v1/models` and uses the first result. Set explicitly if needed. |
+| `memory_dirs` | Directories to walk for `*.md` and `*.txt` files. Recursive is NOT used — flat only. |
+| `memory_files` | Individual files to index (in addition to `memory_dirs`). Glob patterns supported. |
+| `embedding_model` | fastembed model identifier. `BAAI/bge-small-en-v1.5` gives 384-dimensional vectors at ~50ms/query on CPU. |
+| `chunk_size` | Target words per chunk. Chunks follow heading boundaries first, then split by word count. |
+| `top_k_fts` | Candidate count from FTS5 search before merge. |
+| `top_k_vector` | Candidate count from FAISS search before merge. |
+| `top_k_final` | Final results returned. |
+| `rerank_with_qwen` | Default `false`. When `true`, top merged candidates are sent to Qwen for semantic reranking. Adds ~2s latency. |
+| `extract_entities` | Controls whether `indexer.py` runs entity extraction (can be overridden per-run with `--no-entities` / `--extract-entities`). |
+| `ttl_days` | Daily log files older than this are removed from the index (raw files are NOT deleted). |
+
+---
+
+## 6. SQLite Schema
+
+All state is in a single SQLite database. The schema is created automatically on first connection.
+
+```sql
+-- Text chunks from memory files
+CREATE TABLE chunks (
+    id           INTEGER PRIMARY KEY,
+    file_path    TEXT NOT NULL,
+    heading      TEXT DEFAULT '',
+    content      TEXT NOT NULL,
+    start_line   INTEGER DEFAULT 0,
+    end_line     INTEGER DEFAULT 0,
+    file_mtime   REAL,
+    has_entities INTEGER DEFAULT 0,   -- 0=pending, 1=done
+    indexed_at   TEXT DEFAULT (datetime('now'))
+);
+
+-- FTS5 virtual table — kept in sync with chunks via triggers
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    content,
+    heading,
+    content=chunks,
+    content_rowid=id
+);
+
+CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, content, heading)
+    VALUES (new.id, new.content, new.heading);
+END;
+
+CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, heading)
+    VALUES ('delete', old.id, old.content, old.heading);
+END;
+
+-- Embeddings stored as raw float32 blobs
+CREATE TABLE embeddings (
+    chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    vector   BLOB NOT NULL
+);
+
+-- Knowledge graph nodes
+CREATE TABLE nodes (
+    id         INTEGER PRIMARY KEY,
+    type       TEXT NOT NULL,   -- Agent | Task | Concept | Decision | Domain | Person
+    name       TEXT NOT NULL,
+    attributes TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(type, name)
+);
+
+-- Knowledge graph edges
+CREATE TABLE edges (
+    id         INTEGER PRIMARY KEY,
+    src_id     INTEGER REFERENCES nodes(id),
+    rel        TEXT NOT NULL,   -- ASSIGNED_TO | WORKS_ON | KNOWS_ABOUT | DECIDED | RELATES_TO | PRECEDES | MENTIONS
+    dst_id     INTEGER REFERENCES nodes(id),
+    chunk_id   INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Tracks which files have been indexed and their last-seen mtime
+CREATE TABLE file_index (
+    file_path    TEXT PRIMARY KEY,
+    mtime        REAL,
+    chunk_count  INTEGER DEFAULT 0,
+    last_indexed TEXT DEFAULT (datetime('now'))
+);
+
+-- Append-only audit log
+CREATE TABLE audit_log (
+    id           INTEGER PRIMARY KEY,
+    operation    TEXT NOT NULL,   -- search | search_result | facts | related
+    agent_id     TEXT,
+    query        TEXT,
+    result_count INTEGER,
+    ts           TEXT DEFAULT (datetime('now'))
+);
+```
+
+**Migration note:** If the database already exists without the `has_entities` column, `_init_schema` applies a migration:
+```python
+try:
+    conn.execute("ALTER TABLE chunks ADD COLUMN has_entities INTEGER DEFAULT 0")
+    conn.commit()
+except Exception:
+    pass  # column already exists
+```
+
+---
+
+## 7. Core Library — `memory.py`
+
+This file serves as both an importable library and a CLI tool.
+
+### 7.1 Full source
+
+```python
+#!/usr/bin/env python3
+"""
+Memory system core library and CLI.
+
+Usage:
+  memory.py search "query" [--agent AGENT] [--rerank] [--top N]
+  memory.py facts "entity name" [--type TYPE]
+  memory.py related "entity name"
+  memory.py stats
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Optional
+
+import faiss
+import numpy as np
+import requests
+
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+_config: Optional[dict] = None
+_embed_model = None
+_qwen_model_name: Optional[str] = None
+
+
+def load_config() -> dict:
+    global _config
+    if _config is None:
+        with open(CONFIG_PATH) as f:
+            _config = json.load(f)
+    return _config
+
+
+def get_qwen_model() -> str:
+    global _qwen_model_name
+    if _qwen_model_name is None:
+        cfg = load_config()
+        if cfg.get("qwen_model", "auto") != "auto":
+            _qwen_model_name = cfg["qwen_model"]
+        else:
+            r = requests.get(f"{cfg['qwen_base_url']}/models", timeout=5)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            if not data:
+                raise RuntimeError("No models available on Qwen server")
+            _qwen_model_name = data[0]["id"]
+    return _qwen_model_name
+
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from fastembed import TextEmbedding
+        cfg = load_config()
+        _embed_model = TextEmbedding(cfg.get("embedding_model", "BAAI/bge-small-en-v1.5"))
+    return _embed_model
+
+
+def embed_texts(texts: list[str]) -> np.ndarray:
+    model = get_embed_model()
+    vecs = np.array(list(model.embed(texts)), dtype=np.float32)
+    faiss.normalize_L2(vecs)
+    return vecs
+
+
+def get_db() -> sqlite3.Connection:
+    cfg = load_config()
+    db_path = Path(cfg["db_path"])
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _init_schema(conn)
+    return conn
+
+
+def _init_schema(conn: sqlite3.Connection):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id           INTEGER PRIMARY KEY,
+            file_path    TEXT NOT NULL,
+            heading      TEXT DEFAULT '',
+            content      TEXT NOT NULL,
+            start_line   INTEGER DEFAULT 0,
+            end_line     INTEGER DEFAULT 0,
+            file_mtime   REAL,
+            has_entities INTEGER DEFAULT 0,
+            indexed_at   TEXT DEFAULT (datetime('now'))
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            content, heading, content=chunks, content_rowid=id
+        );
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, content, heading)
+            VALUES (new.id, new.content, new.heading);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, content, heading)
+            VALUES ('delete', old.id, old.content, old.heading);
+        END;
+        CREATE TABLE IF NOT EXISTS embeddings (
+            chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+            vector   BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS nodes (
+            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL,
+            attributes TEXT DEFAULT '{}', created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(type, name)
+        );
+        CREATE TABLE IF NOT EXISTS edges (
+            id INTEGER PRIMARY KEY, src_id INTEGER REFERENCES nodes(id),
+            rel TEXT NOT NULL, dst_id INTEGER REFERENCES nodes(id),
+            chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS file_index (
+            file_path TEXT PRIMARY KEY, mtime REAL, chunk_count INTEGER DEFAULT 0,
+            last_indexed TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY, operation TEXT NOT NULL, agent_id TEXT,
+            query TEXT, result_count INTEGER, ts TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN has_entities INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    conn.commit()
+
+
+def build_faiss_index(conn: sqlite3.Connection) -> tuple:
+    rows = conn.execute(
+        "SELECT chunk_id, vector FROM embeddings ORDER BY chunk_id"
+    ).fetchall()
+    if not rows:
+        return faiss.IndexFlatIP(384), []
+    ids = [r["chunk_id"] for r in rows]
+    vecs = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in rows])
+    index = faiss.IndexFlatIP(vecs.shape[1])
+    index.add(vecs)
+    return index, ids
+
+
+def search(
+    query: str,
+    top_k: Optional[int] = None,
+    rerank: bool = False,
+    agent_id: Optional[str] = None,
+) -> list[dict]:
+    cfg = load_config()
+    k_fts = cfg.get("top_k_fts", 20)
+    k_vec = cfg.get("top_k_vector", 20)
+    k_final = top_k or cfg.get("top_k_final", 5)
+
+    conn = get_db()
+    _audit(conn, "search", agent_id, query)
+
+    q_vec = embed_texts([query])
+    index, chunk_ids = build_faiss_index(conn)
+    vector_hits: dict[int, float] = {}
+    if chunk_ids:
+        scores, positions = index.search(q_vec, min(k_vec, len(chunk_ids)))
+        for score, pos in zip(scores[0], positions[0]):
+            if pos >= 0:
+                vector_hits[chunk_ids[pos]] = float(score)
+
+    fts_hits: dict[int, float] = {}
+    safe_query = re.sub(r'[^\w\s]', ' ', query).strip()
+    if safe_query:
+        try:
+            rows = conn.execute(
+                "SELECT rowid, rank FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                (safe_query, k_fts),
+            ).fetchall()
+            max_rank = max((abs(r["rank"]) for r in rows), default=1.0) or 1.0
+            for r in rows:
+                fts_hits[r["rowid"]] = 1.0 - abs(r["rank"]) / max_rank
+        except sqlite3.OperationalError:
+            pass
+
+    all_ids = set(vector_hits) | set(fts_hits)
+    scored = []
+    for cid in all_ids:
+        score = vector_hits.get(cid, 0.0) * 0.6 + fts_hits.get(cid, 0.0) * 0.4
+        scored.append((score, cid))
+    scored.sort(reverse=True)
+    candidate_ids = [cid for _, cid in scored[:max(k_final * 4, 20)]]
+
+    if not candidate_ids:
+        return []
+
+    placeholders = ",".join("?" * len(candidate_ids))
+    rows = conn.execute(
+        f"SELECT id, file_path, heading, content, start_line FROM chunks WHERE id IN ({placeholders})",
+        candidate_ids,
+    ).fetchall()
+    chunk_map = {r["id"]: dict(r) for r in rows}
+    candidates = [chunk_map[cid] for cid in candidate_ids if cid in chunk_map]
+
+    if rerank and candidates:
+        candidates = _qwen_rerank(query, candidates, k_final)
+    else:
+        candidates = candidates[:k_final]
+
+    _audit(conn, "search_result", agent_id, query, len(candidates))
+    conn.close()
+    return candidates
+
+
+def _qwen_rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    numbered = "\n".join(
+        f"[{i+1}] ({Path(c['file_path']).name} | {c['heading']})\n{c['content'][:300]}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = (
+        f'Query: "{query}"\n\nCandidates:\n{numbered}\n\n'
+        f"Return ONLY a JSON array of candidate numbers ranked by relevance "
+        f"(most relevant first). Top {top_k} only."
+    )
+    try:
+        cfg = load_config()
+        r = requests.post(
+            f"{cfg['qwen_base_url']}/chat/completions",
+            json={"model": get_qwen_model(), "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.0, "max_tokens": 64},
+            timeout=15,
+        )
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        match = re.search(r'\[[\d,\s]+\]', text)
+        if match:
+            order = json.loads(match.group())
+            reranked, seen = [], set()
+            for n in order:
+                idx = int(n) - 1
+                if 0 <= idx < len(candidates) and idx not in seen:
+                    reranked.append(candidates[idx])
+                    seen.add(idx)
+                if len(reranked) >= top_k:
+                    break
+            return reranked or candidates[:top_k]
+    except Exception:
+        pass
+    return candidates[:top_k]
+
+
+def get_facts(entity_name: str, entity_type: Optional[str] = None) -> list[dict]:
+    conn = get_db()
+    _audit(conn, "facts", None, entity_name)
+    if entity_type:
+        node = conn.execute(
+            "SELECT id, type, name FROM nodes WHERE name=? AND type=?", (entity_name, entity_type)
+        ).fetchone()
+    else:
+        node = conn.execute(
+            "SELECT id, type, name FROM nodes WHERE name=?", (entity_name,)
+        ).fetchone()
+    if not node:
+        conn.close()
+        return []
+    edges = conn.execute(
+        """
+        SELECT e.rel, n_dst.type AS dst_type, n_dst.name AS dst_name, c.file_path, c.heading
+        FROM edges e JOIN nodes n_dst ON n_dst.id = e.dst_id
+        LEFT JOIN chunks c ON c.id = e.chunk_id WHERE e.src_id = ?
+        UNION ALL
+        SELECT e.rel, n_src.type AS src_type, n_src.name AS src_name, c.file_path, c.heading
+        FROM edges e JOIN nodes n_src ON n_src.id = e.src_id
+        LEFT JOIN chunks c ON c.id = e.chunk_id WHERE e.dst_id = ?
+        """,
+        (node["id"], node["id"]),
+    ).fetchall()
+    conn.close()
+    return [dict(e) for e in edges]
+
+
+def get_related(entity_name: str) -> list[dict]:
+    conn = get_db()
+    _audit(conn, "related", None, entity_name)
+    node = conn.execute("SELECT id FROM nodes WHERE name=?", (entity_name,)).fetchone()
+    if not node:
+        conn.close()
+        return []
+    rows = conn.execute(
+        """
+        SELECT DISTINCT n.type, n.name FROM edges e
+        JOIN nodes n ON n.id IN (e.src_id, e.dst_id)
+        WHERE (e.src_id = ? OR e.dst_id = ?) AND n.id != ?
+        ORDER BY n.type, n.name
+        """,
+        (node["id"], node["id"], node["id"]),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_stats() -> dict:
+    conn = get_db()
+    chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    files = conn.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
+    nodes = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    node_types = conn.execute(
+        "SELECT type, COUNT(*) as n FROM nodes GROUP BY type ORDER BY n DESC"
+    ).fetchall()
+    conn.close()
+    return {"chunks": chunks, "indexed_files": files, "graph_nodes": nodes,
+            "graph_edges": edges, "node_types": {r["type"]: r["n"] for r in node_types}}
+
+
+def _audit(conn, operation, agent_id=None, query=None, result_count=None):
+    try:
+        conn.execute(
+            "INSERT INTO audit_log(operation, agent_id, query, result_count) VALUES (?,?,?,?)",
+            (operation, agent_id, query, result_count),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OpenClaw memory system")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_search = sub.add_parser("search")
+    p_search.add_argument("query")
+    p_search.add_argument("--agent", default=None)
+    p_search.add_argument("--rerank", action="store_true")
+    p_search.add_argument("--top", type=int, default=None)
+    p_search.add_argument("--json", action="store_true", dest="as_json")
+
+    p_facts = sub.add_parser("facts")
+    p_facts.add_argument("entity")
+    p_facts.add_argument("--type", default=None)
+
+    p_related = sub.add_parser("related")
+    p_related.add_argument("entity")
+
+    sub.add_parser("stats")
+
+    args = parser.parse_args()
+
+    if args.cmd == "search":
+        results = search(args.query, top_k=args.top, rerank=args.rerank, agent_id=args.agent)
+        if args.as_json:
+            print(json.dumps(results, indent=2))
+        elif results:
+            for i, r in enumerate(results):
+                source = Path(r['file_path']).name
+                if r.get('heading'):
+                    source += f" › {r['heading']}"
+                if r.get('start_line'):
+                    source += f" (line {r['start_line']})"
+                print(f"[{i+1}] {source}\n{r['content']}\n")
+        else:
+            print("No results found.")
+    elif args.cmd == "facts":
+        facts = get_facts(args.entity, args.type)
+        if facts:
+            for f in facts:
+                print(f"  {f['rel']}  →  {f.get('dst_name') or f.get('src_name')} ({f.get('dst_type') or f.get('src_type')})")
+        else:
+            print(f"No facts found for '{args.entity}'.")
+    elif args.cmd == "related":
+        related = get_related(args.entity)
+        if related:
+            for r in related:
+                print(f"  [{r['type']}] {r['name']}")
+        else:
+            print(f"No related entities found for '{args.entity}'.")
+    elif args.cmd == "stats":
+        s = get_stats()
+        print(f"Indexed files : {s['indexed_files']}")
+        print(f"Chunks        : {s['chunks']}")
+        print(f"Graph nodes   : {s['graph_nodes']}  (edges: {s['graph_edges']})")
+        for t, n in s["node_types"].items():
+            print(f"  {t:12s}: {n}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 8. Indexer — `indexer.py`
+
+Handles chunking, embedding, and entity extraction. **Indexing (chunk + embed) never calls the LLM** — it is fast and has no external dependencies beyond fastembed. Entity extraction is a separate pass.
+
+### 8.1 Key design decisions
+
+- **Indexing and entity extraction are separate steps.** Inline entity extraction caused timeouts because the LLM server was busy serving agents. The two-step approach means the fast path (chunk+embed) always succeeds, and entity extraction runs when the LLM is idle.
+- **Entity extraction batches 5 chunks per LLM call** with a configurable delay between calls (default 3s) to avoid contention.
+- **Retry with exponential backoff** — 3 attempts per batch (10s, 20s, 40s waits), then abandons the run gracefully. Chunks stay at `has_entities=0` and are retried on the next scheduled run.
+- **Mtime-based incremental updates** — files are skipped if their modification time hasn't changed.
+
+### 8.2 Entity types and relationships
+
+The LLM is prompted to extract the following:
+
+| Node type | Examples |
+|---|---|
+| `Agent` | Zoe, Bob, Coder, Researcher, Creator, Planner, Administrator, Steve |
+| `Task` | Specific named tasks or work items |
+| `Concept` | Technical or domain concepts worth remembering |
+| `Decision` | Decisions made (prefixed "Decision: ") |
+| `Domain` | security, health, wealth, education, entertainment |
+| `Person` | Named humans |
+
+Relationship types: `ASSIGNED_TO`, `WORKS_ON`, `KNOWS_ABOUT`, `DECIDED`, `RELATES_TO`, `PRECEDES`, `MENTIONS`
+
+### 8.3 Full source
+
+```python
+#!/usr/bin/env python3
+"""
+Memory indexer.
+
+Usage:
+  indexer.py                        Incremental update (skip unchanged files)
+  indexer.py --full                 Re-index all files
+  indexer.py --file PATH            Index a single file
+  indexer.py --extract-entities     Qwen entity extraction on unprocessed chunks
+  indexer.py --decay                Apply TTL decay to old daily logs
+"""
+import argparse
+import glob as glob_module
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+sys.path.insert(0, str(Path(__file__).parent))
+import memory as mem
+
+ENTITY_PROMPT = """\
+You are extracting structured entities from passages of an AI team's memory log.
+
+{passages}
+
+Return ONLY valid JSON in exactly this format — one entry per passage id:
+{{
+  "chunks": [
+    {{
+      "id": <passage_id>,
+      "entities": [
+        {{"type": "Agent|Task|Concept|Decision|Domain|Person", "name": "canonical name"}}
+      ],
+      "relationships": [
+        {{"from": "name", "rel": "ASSIGNED_TO|WORKS_ON|KNOWS_ABOUT|DECIDED|RELATES_TO|PRECEDES|MENTIONS", "to": "name"}}
+      ]
+    }}
+  ]
+}}
+
+Rules:
+- Agent: Zoe, Bob, Coder, Researcher, Creator, Planner, Administrator, Steve
+- Task: a specific task or work item with a clear name
+- Concept: a technical or domain concept worth remembering
+- Decision: prefix with "Decision: "
+- Domain: security, health, wealth, education, entertainment
+- Only extract what is explicitly mentioned; omit uncertain inferences
+- Keep names short and canonical
+- Use {{"entities": [], "relationships": []}} for a passage with nothing to extract\
+"""
+
+
+def chunk_markdown(file_path: str, chunk_size: int = 300) -> list[dict]:
+    with open(file_path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    chunks, current_heading, current_lines, start_line = [], "", [], 0
+
+    def flush(end_line):
+        text = "".join(current_lines).strip()
+        if not text:
+            return
+        words = text.split()
+        for i in range(0, len(words), max(1, chunk_size)):
+            piece = " ".join(words[i:i + chunk_size])
+            if piece.strip():
+                chunks.append({"file_path": file_path, "heading": current_heading,
+                               "content": piece, "start_line": start_line, "end_line": end_line})
+
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,4} ", line):
+            flush(i)
+            current_heading = line.strip().lstrip("#").strip()
+            current_lines, start_line = [], i + 1
+        else:
+            current_lines.append(line)
+    flush(len(lines))
+    return chunks
+
+
+def index_file(file_path: str, conn, force: bool = False):
+    file_path = str(Path(file_path).resolve())
+    if not Path(file_path).exists():
+        return
+    mtime = Path(file_path).stat().st_mtime
+    existing = conn.execute("SELECT mtime FROM file_index WHERE file_path=?", (file_path,)).fetchone()
+    if existing and not force and abs(existing["mtime"] - mtime) < 0.5:
+        print(f"  [skip] unchanged: {Path(file_path).name}")
+        return
+    print(f"  [index] {Path(file_path).name} ...", end=" ", flush=True)
+    conn.execute(
+        "UPDATE edges SET chunk_id=NULL WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path=?)",
+        (file_path,),
+    )
+    conn.execute("DELETE FROM chunks WHERE file_path=?", (file_path,))
+    conn.commit()
+    cfg = mem.load_config()
+    chunks = chunk_markdown(file_path, cfg.get("chunk_size", 300))
+    if not chunks:
+        print("empty")
+        return
+    vecs = mem.embed_texts([c["content"] for c in chunks])
+    for chunk, vec in zip(chunks, vecs):
+        cur = conn.execute(
+            "INSERT INTO chunks(file_path, heading, content, start_line, end_line, file_mtime, has_entities) VALUES (?,?,?,?,?,?,0)",
+            (chunk["file_path"], chunk["heading"], chunk["content"],
+             chunk["start_line"], chunk["end_line"], mtime),
+        )
+        conn.execute("INSERT INTO embeddings(chunk_id, vector) VALUES (?,?)", (cur.lastrowid, vec.tobytes()))
+    conn.execute(
+        "INSERT INTO file_index(file_path, mtime, chunk_count) VALUES (?,?,?) "
+        "ON CONFLICT(file_path) DO UPDATE SET mtime=excluded.mtime, chunk_count=excluded.chunk_count, last_indexed=datetime('now')",
+        (file_path, mtime, len(chunks)),
+    )
+    conn.commit()
+    print(f"{len(chunks)} chunks")
+
+
+def collect_files(cfg: dict) -> list[str]:
+    files = []
+    for pattern in cfg.get("memory_files", []):
+        files.extend(glob_module.glob(pattern))
+    for d in cfg.get("memory_dirs", []):
+        for ext in ("*.md", "*.txt"):
+            files.extend(glob_module.glob(str(Path(d) / ext)))
+    return sorted(set(str(Path(f).resolve()) for f in files if Path(f).exists()))
+
+
+def _call_qwen(prompt: str, timeout: int = 60):
+    cfg = mem.load_config()
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{cfg['qwen_base_url']}/chat/completions",
+                json={"model": mem.get_qwen_model(),
+                      "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0.0, "max_tokens": 1024},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except requests.exceptions.Timeout:
+            wait = 10 * (2 ** attempt)
+            print(f"    [retry {attempt+1}/3] timeout, waiting {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+        except Exception as e:
+            print(f"    [warn] Qwen call failed: {e}", file=sys.stderr)
+            return None
+    return None
+
+
+def _store_entities(data: dict, chunk_id_map: dict, conn) -> int:
+    cid = data.get("id")
+    if cid not in chunk_id_map:
+        return 0
+    node_ids = {}
+    for ent in data.get("entities", []):
+        name = str(ent.get("name", "")).strip()
+        etype = str(ent.get("type", "Concept")).strip()
+        if not name:
+            continue
+        conn.execute("INSERT OR IGNORE INTO nodes(type, name) VALUES (?,?)", (etype, name))
+        row = conn.execute("SELECT id FROM nodes WHERE type=? AND name=?", (etype, name)).fetchone()
+        if row:
+            node_ids[name] = row["id"]
+    for rel in data.get("relationships", []):
+        src, dst, rtype = str(rel.get("from","")).strip(), str(rel.get("to","")).strip(), str(rel.get("rel","RELATES_TO")).strip()
+        if src in node_ids and dst in node_ids:
+            conn.execute("INSERT INTO edges(src_id, rel, dst_id, chunk_id) VALUES (?,?,?,?)",
+                         (node_ids[src], rtype, node_ids[dst], chunk_id_map[cid]))
+    conn.execute("UPDATE chunks SET has_entities=1 WHERE id=?", (chunk_id_map[cid],))
+    return len(data.get("entities", []))
+
+
+def run_entity_extraction(conn, batch_size: int = 5, delay: float = 3.0):
+    pending = conn.execute("SELECT id, content FROM chunks WHERE has_entities=0 ORDER BY id").fetchall()
+    if not pending:
+        print("  No chunks pending entity extraction.")
+        return
+    total, total_entities, processed = len(pending), 0, 0
+    print(f"  Extracting entities from {total} chunks (batch={batch_size}, delay={delay}s)...")
+    for batch_start in range(0, total, batch_size):
+        batch = pending[batch_start:batch_start + batch_size]
+        passages = "\n\n".join(
+            f"Passage {i+1} (id: {row['id']}):\n---\n{row['content'][:800]}\n---"
+            for i, row in enumerate(batch)
+        )
+        chunk_id_map = {i + 1: row["id"] for i, row in enumerate(batch)}
+        raw = _call_qwen(ENTITY_PROMPT.format(passages=passages))
+        if raw is None:
+            print(f"    [skip] batch {batch_start//batch_size + 1} — LLM unavailable")
+            break
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                result = json.loads(match.group())
+                for chunk_data in result.get("chunks", []):
+                    total_entities += _store_entities(chunk_data, chunk_id_map, conn)
+                    processed += 1
+                conn.commit()
+            except Exception:
+                for row in batch:
+                    conn.execute("UPDATE chunks SET has_entities=1 WHERE id=?", (row["id"],))
+                conn.commit()
+        print(f"  [{min(batch_start + batch_size, total)}/{total}] +{total_entities} entities", flush=True)
+        if batch_start + batch_size < total:
+            time.sleep(delay)
+    print(f"  Done. {total_entities} entities extracted from {processed} chunks.")
+
+
+def apply_decay(conn):
+    cfg = mem.load_config()
+    ttl = cfg.get("ttl_days", 90)
+    rows = conn.execute(
+        "SELECT DISTINCT file_path FROM chunks WHERE date(indexed_at) < date('now', ? || ' days')",
+        (f"-{ttl}",),
+    ).fetchall()
+    for row in rows:
+        fp = row["file_path"]
+        if re.search(r"/memory/\d{4}-\d{2}-\d{2}", fp):
+            print(f"  [decay] {Path(fp).name}")
+            conn.execute("DELETE FROM chunks WHERE file_path=?", (fp,))
+    conn.commit()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OpenClaw memory indexer")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--file", default=None)
+    parser.add_argument("--extract-entities", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--delay", type=float, default=3.0)
+    parser.add_argument("--decay", action="store_true")
+    args = parser.parse_args()
+    conn = mem.get_db()
+    if args.decay:
+        print("Applying TTL decay...")
+        apply_decay(conn)
+    elif args.extract_entities:
+        run_entity_extraction(conn, batch_size=args.batch_size, delay=args.delay)
+        s = mem.get_stats()
+        print(f"Graph: {s['graph_nodes']} nodes, {s['graph_edges']} edges.")
+    else:
+        files = [args.file] if args.file else collect_files(mem.load_config())
+        print(f"Indexing {len(files)} file(s)...")
+        for fp in files:
+            index_file(fp, conn, force=args.full)
+        s = mem.get_stats()
+        print(f"\nDone. {s['chunks']} chunks across {s['indexed_files']} files.")
+        print("Run with --extract-entities to populate the knowledge graph.")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 9. File Watcher — `watcher.py`
+
+Optional daemon that watches memory directories and triggers incremental re-indexing on any file change. Suitable for development or installations where real-time indexing is preferred over the scheduled approach.
+
+```python
+#!/usr/bin/env python3
+"""
+Memory file watcher daemon.
+Usage: watcher.py [--no-entities]
+"""
+import sys
+import time
+from pathlib import Path
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+sys.path.insert(0, str(Path(__file__).parent))
+import indexer
+import memory as mem
+
+WATCHED_EXTENSIONS = {".md", ".txt"}
+
+
+class MemoryHandler(FileSystemEventHandler):
+    def __init__(self, do_entities: bool):
+        self.do_entities = do_entities
+
+    def _should_handle(self, path):
+        return Path(path).suffix in WATCHED_EXTENSIONS
+
+    def on_modified(self, event):
+        if not event.is_directory and self._should_handle(event.src_path):
+            self._reindex(event.src_path)
+
+    def on_created(self, event):
+        if not event.is_directory and self._should_handle(event.src_path):
+            self._reindex(event.src_path)
+
+    def _reindex(self, path):
+        print(f"[watcher] {Path(path).name}", flush=True)
+        try:
+            conn = mem.get_db()
+            indexer.index_file(path, conn, force=True)
+            conn.close()
+        except Exception as e:
+            print(f"[watcher] error: {e}", flush=True)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-entities", action="store_true")
+    args = parser.parse_args()
+    cfg = mem.load_config()
+    watch_dirs = list(cfg.get("memory_dirs", []))
+    for fp in cfg.get("memory_files", []):
+        parent = str(Path(fp).parent)
+        if parent not in watch_dirs:
+            watch_dirs.append(parent)
+    handler = MemoryHandler(do_entities=not args.no_entities)
+    observer = Observer()
+    for d in watch_dirs:
+        if Path(d).exists():
+            observer.schedule(handler, d, recursive=False)
+            print(f"[watcher] watching {d}")
+    observer.start()
+    print("[watcher] running — Ctrl-C to stop", flush=True)
+    try:
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 10. OpenClaw Skill — `SKILL.md`
+
+Place this file at `~/.openclaw/skills/memory/SKILL.md`. OpenClaw file-watches the skills directory — no restart needed.
+
+```markdown
+---
+name: memory
+description: >
+  Use this skill to search the team's persistent memory — past decisions, task outcomes,
+  agent knowledge, and daily logs. Use when you need to recall what the team knows about
+  a topic, find a past decision, look up facts about an entity, or discover which agents
+  worked on something. Prefer this over re-reading raw memory files for any non-trivial lookup.
+version: 1.0.0
+---
+
+# Team Memory System
+
+Hybrid semantic + keyword search over all team memory files, backed by a knowledge graph
+extracted by the local LLM.
+
+All commands use the venv Python at:
+/path/to/scripts/memory/.venv/bin/python
+
+## Search
+
+    .venv/bin/python memory.py search "your query"
+    .venv/bin/python memory.py search "query" --top 3
+    .venv/bin/python memory.py search "query" --rerank      # Qwen reranking, +~2s
+    .venv/bin/python memory.py search "query" --agent my-id # audit tagging
+
+## Knowledge graph
+
+    .venv/bin/python memory.py facts "Researcher"
+    .venv/bin/python memory.py related "Docker"
+
+## Stats
+
+    .venv/bin/python memory.py stats
+
+## Re-indexing (manual)
+
+    # Step 1 — chunk + embed (fast, no LLM)
+    .venv/bin/python indexer.py
+    .venv/bin/python indexer.py --full
+    .venv/bin/python indexer.py --file /path/to/memory/2026-03-03.md
+
+    # Step 2 — entity extraction (calls LLM in batches)
+    .venv/bin/python indexer.py --extract-entities
+    .venv/bin/python indexer.py --extract-entities --batch-size 3 --delay 5
+```
+
+---
+
+## 11. OpenClaw Cron Jobs
+
+Add these three entries to `~/.openclaw/cron/jobs.json` under the `"jobs"` array. Replace `agent:main:main` with the appropriate session key for the agent that should own memory maintenance (on the reference instance this is Zoe/main).
+
+Generate UUIDs with `python3 -c "import uuid; print(uuid.uuid4())"`.
+
+```json
+{
+  "id": "<uuid>",
+  "agentId": "main",
+  "sessionKey": "agent:main:main",
+  "name": "memory-index-30m",
+  "description": "Incremental memory index — chunk and embed changed memory files",
+  "enabled": true,
+  "createdAtMs": <now_ms>,
+  "updatedAtMs": <now_ms>,
+  "schedule": { "kind": "every", "everyMs": 1800000, "anchorMs": <now_ms> },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "model": "local/<model-id>",
+    "message": "Memory system maintenance (automated). Run the incremental memory index:\n\n/path/to/scripts/memory/.venv/bin/python /path/to/scripts/memory/indexer.py\n\nNo LLM calls needed. Report the summary line from the output."
+  },
+  "delivery": { "mode": "none", "channel": "last" }
+},
+{
+  "id": "<uuid>",
+  "agentId": "main",
+  "sessionKey": "agent:main:main",
+  "name": "memory-extract-entities-nightly",
+  "description": "Nightly entity extraction — populate knowledge graph",
+  "enabled": true,
+  "createdAtMs": <now_ms>,
+  "updatedAtMs": <now_ms>,
+  "schedule": { "kind": "cron", "expr": "0 3 * * *", "tz": "UTC" },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "model": "local/<model-id>",
+    "message": "Memory system maintenance (automated). Run entity extraction:\n\n/path/to/scripts/memory/.venv/bin/python /path/to/scripts/memory/indexer.py --extract-entities\n\nCalls LLM in batches with 3s delay. May take 10-15 minutes. Report final entity and graph counts.",
+    "timeoutSeconds": 1200
+  },
+  "delivery": { "mode": "none", "channel": "last" }
+},
+{
+  "id": "<uuid>",
+  "agentId": "main",
+  "sessionKey": "agent:main:main",
+  "name": "memory-decay-weekly",
+  "description": "Weekly TTL decay — prune old daily log chunks",
+  "enabled": true,
+  "createdAtMs": <now_ms>,
+  "updatedAtMs": <now_ms>,
+  "schedule": { "kind": "cron", "expr": "30 3 * * 0", "tz": "UTC" },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "model": "local/<model-id>",
+    "message": "Memory system maintenance (automated). Apply TTL decay (removes chunks older than 90 days; raw files preserved):\n\n/path/to/scripts/memory/.venv/bin/python /path/to/scripts/memory/indexer.py --decay\n\nReport which files were decayed."
+  },
+  "delivery": { "mode": "none", "channel": "last" }
+}
+```
+
+Reload the gateway after editing: `kill -HUP <openclaw-gateway-pid>`
+
+---
+
+## 12. PROCESSES.md Agent Instructions
+
+Add a section to your team's PROCESSES.md (or equivalent agent context document) so agents know to use memory search:
+
+```markdown
+### Memory Search
+
+Before starting research on any topic, search team memory first to avoid duplicating work.
+
+    memory search "your question in natural language"
+
+Examples:
+    memory search "Docker security assessment outcome"
+    memory search "what do we know about TrueNAS credentials"
+    memory search "decisions made about TMS architecture"
+
+Options:
+- `--top 3` — fewer, more focused results
+- `--rerank` — better precision via LLM reranking (+~2s)
+- `--agent your-id` — audit log tagging
+
+Knowledge graph:
+    memory facts "Researcher"
+    memory related "Docker"
+    memory stats
+```
+
+---
+
+## 13. Installation Checklist
+
+```
+[ ] Python 3.12+ available
+[ ] SQLite FTS5 supported (run verification command in §3)
+[ ] Local LLM API accessible and responding at configured URL
+[ ] Create directory: scripts/memory/
+[ ] Create: config.json  (update all paths and qwen_base_url)
+[ ] Create: memory.py
+[ ] Create: indexer.py
+[ ] Create: watcher.py
+[ ] python3 -m venv .venv
+[ ] .venv/bin/pip install fastembed faiss-cpu watchdog
+[ ] First index run: .venv/bin/python indexer.py
+[ ] Verify search: .venv/bin/python memory.py search "test query"
+[ ] Create skill directory: ~/.openclaw/skills/memory/
+[ ] Create: SKILL.md  (update paths)
+[ ] Add three cron jobs to ~/.openclaw/cron/jobs.json
+[ ] Reload gateway: kill -HUP <pid>
+[ ] Update PROCESSES.md with agent instructions
+[ ] Schedule entity extraction when LLM is idle: indexer.py --extract-entities
+```
+
+---
+
+## 14. Acceptance Criteria
+
+| Criterion | Target | How to verify |
+|---|---|---|
+| Search latency | <500ms per query | `time .venv/bin/python memory.py search "test"` |
+| Search quality | Relevant result in top 3 for known past decisions | Manual spot checks |
+| Indexing | All memory files indexed | `memory.py stats` shows correct file count |
+| Entity extraction | Graph populated after nightly run | `memory.py stats` shows nodes > 0 |
+| Model agnosticism | Works after model swap | Change LLM, re-run search — no config change needed |
+| Decay | Old daily logs removed from index | Check stats before/after `indexer.py --decay` on old data |
+| Audit log | All searches recorded | `SELECT * FROM audit_log ORDER BY ts DESC LIMIT 10` in SQLite |
+
+---
+
+## 15. Known Limitations & Future Upgrade Path
+
+| Limitation | Mitigation | Upgrade path |
+|---|---|---|
+| Scale ceiling ~500K chunks | Corpus unlikely to reach this for months | Swap FAISS flat → FAISS IVF; SQLite embeddings → Qdrant |
+| No concurrent write safety | Single writer (indexer runs sequentially) | Add write lock or migrate to Qdrant for concurrent agents |
+| Entity extraction quality depends on LLM | Larger/better model = better graph | Model upgrade is transparent (auto-detected) |
+| Graph queries are sequential (vector then graph) | Acceptable at current scale | Migrate to Kùzu for single-pass hybrid queries at >100K nodes |
+| FTS5 is English-optimised | Corpus is English | Add language-specific tokeniser if needed |
+
+---
+
+*Generated from implementation session 2026-03-03. Implemented by Claude Sonnet 4.6.*
