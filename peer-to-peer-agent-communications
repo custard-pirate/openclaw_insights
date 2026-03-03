@@ -1,0 +1,144 @@
+# OpenClaw — Peer-to-Peer Agent Communication Guide
+
+A practical reference for setting up direct agent-to-agent (A2A) communication in OpenClaw using the ACP protocol.
+
+---
+
+## Overview
+
+By default, agents in OpenClaw communicate through their designated coordinator (e.g. a Chief of Staff agent). This guide shows how to enable **direct peer-to-peer messaging** so specialists can talk without routing everything through a coordinator — reducing latency and bottlenecks.
+
+---
+
+## 1. Enable ACP
+
+In `openclaw.json`, enable ACP at the top level and set the backend to `acpx`:
+
+```json
+"acp": {
+  "enabled": true,
+  "dispatch": {
+    "enabled": true
+  },
+  "backend": "acpx",
+  "defaultAgent": "<your-coordinator-agent-id>",
+  "allowedAgents": [
+    "agent-id-1",
+    "agent-id-2",
+    "agent-id-3"
+  ]
+}
+```
+
+- `defaultAgent` — receives ACP messages that don't specify a target
+- `allowedAgents` — which agents can participate in ACP (omit any you don't want reachable)
+
+---
+
+## 2. Enable the acpx Plugin
+
+ACP in OpenClaw uses the `acpx` extension. Add it to your plugins config:
+
+```json
+"plugins": {
+  "entries": {
+    "acpx": {
+      "enabled": true,
+      "config": {
+        "timeoutSeconds": 120
+      }
+    }
+  }
+}
+```
+
+> **Why 120s?** The default timeout is 30s. If the target agent is mid-turn when a message arrives, acpx queues it and waits for the current LLM call to complete. Slow models (e.g. DeepSeek-R1) can take 60–90s per turn. Set `timeoutSeconds` to at least 120 to avoid spurious timeouts.
+
+> **Note:** `queueOwnerTtlSeconds` defaults to 0.1s — this is intentional for OpenClaw. Do not increase it.
+
+> **First run:** The `acpx` binary is lazy-installed on first use via `npm install acpx@0.1.13` into `/usr/lib/node_modules/openclaw/extensions/acpx/node_modules/`.
+
+---
+
+## 3. Session Keys
+
+Every agent has a **permanent session key** that other agents use to address it directly. The format is:
+
+```
+agent:<agent-id>:main
+```
+
+Examples:
+
+| Agent ID | Session Key |
+|----------|-------------|
+| `main` | `agent:main:main` |
+| `coder` | `agent:coder:main` |
+| `researcher` | `agent:researcher:main` |
+| `planner` | `agent:planner:main` |
+| `creator` | `agent:creator:main` |
+| `administrator` | `agent:administrator:main` |
+
+The session key is derived from the agent's `id` in `openclaw.json` — no additional configuration is required. These sessions are permanent and always available as long as the agent exists.
+
+---
+
+## 4. Sending a Message
+
+Agents use the `sessions_send` tool to contact a peer directly:
+
+```
+sessions_send(
+  sessionKey: "agent:researcher:main",
+  message: "Can you look up X and send me a summary? I need it for task Y."
+)
+```
+
+The target agent receives this as a new message in its session and responds normally. The calling agent waits for the reply (up to `timeoutSeconds`).
+
+---
+
+## 5. Routing Guidelines
+
+Tell your agents when to go direct vs. when to involve the coordinator. A good rule of thumb:
+
+| Scenario | Action |
+|----------|--------|
+| Need a specific capability another agent has | Go direct (`sessions_send`) |
+| Self-contained, bilateral task | Go direct |
+| Work crosses 3+ agents and needs coordination | CC coordinator |
+| Significant decision affecting team direction | CC coordinator |
+| Stuck after 2h or 3 failed attempts including a peer consult | Escalate to coordinator |
+| Task originally requested by the human | CC coordinator on completion |
+
+---
+
+## 6. No-Response Handling
+
+If a target agent doesn't respond:
+
+- **Likely cause:** Agent is mid-turn on a slow LLM call. acpx queues the message and waits.
+- **Resolution:** Wait. The agent will respond when its current turn finishes.
+- **Timeout:** If still no response after `timeoutSeconds`, the call fails — retry or route through coordinator.
+- **Practical rule:** For non-urgent messages, wait up to 15 minutes before escalating.
+
+---
+
+## 7. Reload Config
+
+After editing `openclaw.json`, reload the gateway without downtime:
+
+```bash
+kill -HUP $(ps aux | grep openclaw-gateway | grep -v grep | awk '{print $2}')
+```
+
+---
+
+## Known Gotchas
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| Timeout errors despite agent being alive | Default 30s timeout too short for slow models | Set `timeoutSeconds: 120` in acpx config |
+| Agent not reachable | Not listed in `allowedAgents` | Add agent ID to the array |
+| `acpx` binary missing | First run, not yet installed | Trigger any ACP message — lazy install runs automatically |
+| DeepSeek models emitting raw XML tool calls | Training data contamination from Claude format | Avoid DeepSeek for agents that rely heavily on tool calls |
